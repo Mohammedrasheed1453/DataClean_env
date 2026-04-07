@@ -7,28 +7,33 @@ LABEL space.tags="openenv"
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+# Install system dependencies (critical for sklearn, numpy, etc.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    build-essential \
+    gcc \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+# Upgrade pip (important for dependency resolution)
+RUN pip install --upgrade pip
+
+# Copy entire project
+COPY . .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY models.py            .
-COPY dataset_generator.py .
-COPY client.py            .
-COPY inference.py         .
-COPY grader.py            .
-COPY openenv.yaml         .
-COPY __init__.py          .
-COPY server/              ./server/
-
+# Create non-root user
 RUN useradd -m -u 1000 user
 USER user
 ENV HOME=/home/user PATH=/home/user/.local/bin:$PATH
 
+# Expose API port
 EXPOSE 7860
 
+# Health check (required)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD curl -f http://localhost:7860/health || exit 1
 
+# Run server
 CMD ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "7860"]
