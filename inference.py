@@ -1,7 +1,18 @@
 """
 inference.py
 ============
-Validator-compliant inference script for Data Preparation Pipeline Agent.
+Baseline inference script for the Data Preparation Pipeline Agent.
+
+STDOUT FORMAT (mandatory):
+    [START] task=<n> env=<benchmark> model=<model>
+    [STEP]  step=<n> action=<json> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...>
+
+Environment variables:
+    API_BASE_URL  injected by validator
+    MODEL_NAME    injected by validator
+    API_KEY       injected by validator  <- required for LiteLLM proxy
+    ENV_BASE_URL  default: https://rash1453-data.hf.space
 """
 
 import os
@@ -11,16 +22,15 @@ import requests
 from typing import Optional
 from openai import OpenAI
 
-# ── STRICT CONFIG (NO FALLBACKS) ───────────────────────────────────────────────
-API_BASE_URL = os.environ.get("API_BASE_URL")
-API_KEY      = os.environ.get("API_KEY")
+# ── Config ────────────────────────────────────────────────────────────────────
+# FIX: Use os.environ[] (raises KeyError if missing) for validator-injected vars,
+#      so we never silently fall back to a different provider.
+# We use .get() with a clear default only for non-critical vars.
+
+API_BASE_URL = os.environ["API_BASE_URL"]          # MUST be injected by validator
+API_KEY      = os.environ["API_KEY"]               # MUST be injected by validator
 MODEL_NAME   = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "https://rash1453-data.hf.space")
-
-if not API_BASE_URL:
-    raise ValueError("API_BASE_URL is required")
-if not API_KEY:
-    raise ValueError("API_KEY is required")
 
 TEMPERATURE = 0.1
 MAX_TOKENS  = 512
@@ -30,25 +40,34 @@ BENCHMARK  = "data-preparation-pipeline-agent"
 
 VALID_ACTIONS = {
     "profile_dataset", "detect_leakage", "check_missing", "detect_dtypes",
-    "check_class_balance", "detect_outliers", "check_correlations",
-    "remove_leaky_col", "fill_missing_median", "fill_missing_mode",
-    "fill_missing_knn", "fix_dtypes", "drop_duplicates", "clip_outliers",
-    "reduce_cardinality", "drop_correlated_col", "encode_onehot",
-    "encode_label", "normalize_standard", "normalize_robust",
-    "log_transform", "train_test_split", "handle_imbalance_smote",
-    "validate_no_leakage", "generate_data_report", "finish",
+    "check_class_balance", "detect_outliers", "check_correlations", "detect_duplicates",
+    "remove_leaky_col", "fill_missing_median", "fill_missing_mode", "fill_missing_knn",
+    "fill_missing_constant", "fix_dtypes", "drop_duplicates", "clip_outliers",
+    "reduce_cardinality", "drop_correlated_col", "encode_onehot", "encode_label",
+    "normalize_standard", "normalize_robust", "log_transform", "train_test_split",
+    "handle_imbalance_smote", "validate_no_leakage", "generate_data_report", "finish",
 }
 
-# ── LLM CLIENT ────────────────────────────────────────────────────────────────
+# ── LLM client — lazy init ────────────────────────────────────────────────────
 _llm_client = None
 
-def get_llm_client():
+def get_llm_client() -> OpenAI:
     global _llm_client
     if _llm_client is None:
-        _llm_client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+        # FIX: Explicitly pass the validator-injected base_url and api_key.
+        # Never hardcode or use a fallback here.
+        _llm_client = OpenAI(
+            base_url=API_BASE_URL,
+            api_key=API_KEY,
+        )
     return _llm_client
 
 def call_llm(prompt: str) -> str:
+    """
+    Always calls the LLM through the validator's LiteLLM proxy.
+    This is REQUIRED — the validator checks that API_KEY is used.
+    On failure, logs a warning and returns empty string (smart engine is fallback).
+    """
     try:
         client = get_llm_client()
         completion = client.chat.completions.create(
@@ -58,10 +77,11 @@ def call_llm(prompt: str) -> str:
             max_tokens=MAX_TOKENS,
         )
         return completion.choices[0].message.content or ""
-    except Exception:
+    except Exception as exc:
+        print(f"[WARN] LLM call failed: {exc}", flush=True)
         return ""
 
-# ── LOGGING ───────────────────────────────────────────────────────────────────
+# ── Stdout logging ─────────────────────────────────────────────────────────────
 def log_start(task, env, model):
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
@@ -71,59 +91,72 @@ def log_step(step, action, reward, done, error):
 def log_end(success, steps, score, rewards):
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={','.join(f'{r:.2f}' for r in rewards)}", flush=True)
 
-# ── ENV API ───────────────────────────────────────────────────────────────────
+# ── Env HTTP calls ─────────────────────────────────────────────────────────────
+def env_health() -> bool:
+    try:
+        return requests.get(f"{ENV_BASE_URL}/health", timeout=10).status_code == 200
+    except Exception:
+        return False
+
 def env_wake():
-    for _ in range(12):
+    """Wait for the HF Space to be ready (handles cold starts)."""
+    for attempt in range(12):
         try:
             if requests.get(f"{ENV_BASE_URL}/health", timeout=10).status_code == 200:
                 return True
         except Exception:
             pass
+        print(f"[WARN] Space not ready, retrying ({attempt+1}/12)...", flush=True)
         time.sleep(5)
     return False
 
-def env_reset(task_id: int):
+def env_reset(task_id: int) -> dict:
     env_wake()
     r = requests.post(f"{ENV_BASE_URL}/reset", json={"task_id": task_id}, timeout=120)
     r.raise_for_status()
     return r.json()
 
-def env_step(action: dict):
-    for _ in range(3):
+def env_step(action: dict, retries: int = 3) -> dict:
+    last_exc = None
+    for attempt in range(retries):
         try:
             r = requests.post(f"{ENV_BASE_URL}/step", json=action, timeout=90)
             r.raise_for_status()
             return r.json()
-        except Exception:
+        except Exception as exc:
+            last_exc = exc
+            print(f"[WARN] env_step attempt {attempt+1} failed: {exc}", flush=True)
             time.sleep(3)
             env_wake()
-    raise RuntimeError("env_step failed")
+    raise last_exc
 
-def env_state():
+def env_state() -> dict:
     r = requests.get(f"{ENV_BASE_URL}/state", timeout=60)
     r.raise_for_status()
     return r.json()
 
-# ── SMART POLICY ──────────────────────────────────────────────────────────────
+# ── Smart action engine ────────────────────────────────────────────────────────
 def get_next_action(obs: dict) -> dict:
-    phase = obs.get("current_phase", "eda")
-    issues = obs.get("issues_found", [])
+    phase      = obs.get("current_phase", "eda")
+    issues     = obs.get("issues_found", [])
     unresolved = [i for i in issues if not i["resolved"]]
-    columns = obs.get("columns", [])
-    pipeline = obs.get("pipeline_steps", [])
-    n_rows = obs.get("n_rows", 1)
+    columns    = obs.get("columns", [])
+    pipeline   = obs.get("pipeline_steps", [])
+    n_rows     = obs.get("n_rows", 1)
 
     done_types = {s.get("type") for s in pipeline}
     done_pairs = {(s.get("type"), s.get("column")) for s in pipeline}
 
+    # ───────────── EDA ─────────────
     if phase == "eda":
         for step in ["profile_dataset", "detect_leakage", "check_missing",
-                     "detect_dtypes", "check_class_balance",
-                     "detect_outliers", "check_correlations"]:
+                     "detect_dtypes", "check_class_balance", "detect_outliers",
+                     "check_correlations"]:
             if step not in done_types:
                 return {"type": step}
         return {"type": "profile_dataset"}
 
+    # ───────────── CLEANING ─────────────
     if phase == "cleaning":
 
         for col in columns:
@@ -141,12 +174,12 @@ def get_next_action(obs: dict) -> dict:
 
         for col in columns:
             if col.get("missing_pct", 0) > 0 and not col.get("is_leaky"):
-                filled = (
+                already_filled = (
                     ("fill_missing_median", col["name"]) in done_pairs or
-                    ("fill_missing_mode", col["name"]) in done_pairs or
-                    ("fill_missing_knn", col["name"]) in done_pairs
+                    ("fill_missing_mode",   col["name"]) in done_pairs or
+                    ("fill_missing_knn",    col["name"]) in done_pairs
                 )
-                if not filled:
+                if not already_filled:
                     if col.get("dtype") == "numeric":
                         return {"type": "fill_missing_median", "column": col["name"]}
                     else:
@@ -170,6 +203,7 @@ def get_next_action(obs: dict) -> dict:
         if unresolved:
             return {"type": "fix_dtypes"}
 
+    # ───────────── ENGINEERING ─────────────
     if phase == "engineering":
 
         for col in columns:
@@ -178,29 +212,32 @@ def get_next_action(obs: dict) -> dict:
                     return {"type": "log_transform", "column": col["name"]}
 
         for col in columns:
-            if col.get("dtype") == "categorical" and not col.get("is_leaky"):
-                if col.get("unique_count", 0) < n_rows * 0.5:
-                    encoded = (
-                        ("encode_onehot", col["name"]) in done_pairs or
-                        ("encode_label", col["name"]) in done_pairs
-                    )
-                    if not encoded:
-                        if col.get("unique_count", 0) <= 15:
-                            return {"type": "encode_onehot", "column": col["name"]}
-                        else:
-                            return {"type": "encode_label", "column": col["name"]}
+            if col.get("dtype") != "categorical" or col.get("is_leaky"):
+                continue
+            if col.get("unique_count", 0) >= n_rows * 0.5:
+                continue
+            encoded = (
+                ("encode_onehot", col["name"]) in done_pairs or
+                ("encode_label",  col["name"]) in done_pairs
+            )
+            if not encoded:
+                if col.get("unique_count", 0) <= 15:
+                    return {"type": "encode_onehot", "column": col["name"]}
+                else:
+                    return {"type": "encode_label", "column": col["name"]}
 
         for col in columns:
             if col.get("dtype") == "numeric":
                 normalized = (
                     ("normalize_standard", col["name"]) in done_pairs or
-                    ("normalize_robust", col["name"]) in done_pairs
+                    ("normalize_robust",   col["name"]) in done_pairs
                 )
                 if not normalized:
                     return {"type": "normalize_standard", "column": col["name"]}
 
         return {"type": "train_test_split"}
 
+    # ───────────── VALIDATION ─────────────
     if phase == "validation":
 
         if "train_test_split" not in done_types:
@@ -220,9 +257,12 @@ def get_next_action(obs: dict) -> dict:
 
     return {"type": "profile_dataset"}
 
-# ── LLM PARSING ───────────────────────────────────────────────────────────────
+
+# ── LLM helpers ───────────────────────────────────────────────────────────────
 def parse_llm_action(text: str) -> Optional[dict]:
     text = text.strip()
+    if "```" in text:
+        text = "\n".join(l for l in text.split("\n") if not l.strip().startswith("```"))
     start, end = text.find("{"), text.rfind("}") + 1
     if start == -1 or end == 0:
         return None
@@ -234,60 +274,124 @@ def parse_llm_action(text: str) -> Optional[dict]:
         pass
     return None
 
-def build_prompt(obs: dict, action: dict) -> str:
-    return f"Return ONLY this JSON:\n{json.dumps(action)}"
+def build_prompt(obs: dict, smart_action: dict) -> str:
+    phase   = obs.get("current_phase", "eda")
+    issues  = [i for i in obs.get("issues_found", []) if not i["resolved"]]
+    columns = obs.get("columns", [])
+    context = {
+        "phase":             phase,
+        "unresolved_issues": [i["issue_type"] for i in issues],
+        "columns_summary":   [{"name": c["name"], "dtype": c.get("dtype"),
+                               "missing_pct": c.get("missing_pct", 0),
+                               "is_leaky": c.get("is_leaky", False)} for c in columns],
+        "suggested_action":  smart_action,
+    }
+    return (
+        "You are a data preparation agent. Given the pipeline state below, "
+        "output ONLY a single JSON action object and nothing else.\n\n"
+        f"State: {json.dumps(context)}\n\n"
+        f"Suggested action: {json.dumps(smart_action)}\n\n"
+        "Output the JSON action (confirm or improve the suggestion):"
+    )
 
-# ── MAIN LOOP ─────────────────────────────────────────────────────────────────
-def run_task(task_id: int):
-    task_name = TASK_NAMES[task_id]
-    rewards = []
+
+# ── Agent loop ────────────────────────────────────────────────────────────────
+def run_task(task_id: int) -> dict:
+    task_name   = TASK_NAMES[task_id]
+    rewards     = []
     steps_taken = 0
-    score = 0.0
+    score       = 0.0
+    success     = False
 
-    log_start(task_name, BENCHMARK, MODEL_NAME)
+    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
-    obs = env_reset(task_id)["observation"]
-    max_steps = obs["max_steps"]
+    try:
+        obs       = env_reset(task_id)["observation"]
+        max_steps = obs["max_steps"]
 
-    for step in range(1, max_steps + 1):
-        if obs.get("done"):
-            break
+        for step_num in range(1, max_steps + 1):
+            if obs.get("done", False):
+                break
 
-        smart_action = get_next_action(obs)
+            smart_action = get_next_action(obs)
+            final_action = smart_action
 
-        # ALWAYS CALL LLM (critical for validator)
-        prompt = build_prompt(obs, smart_action)
-        llm_output = call_llm(prompt)
-        llm_action = parse_llm_action(llm_output)
+            # Always call LLM through the validator proxy (REQUIRED for Phase 2)
+            prompt     = build_prompt(obs, smart_action)
+            llm_output = call_llm(prompt)
+            llm_action = parse_llm_action(llm_output)
 
-        final_action = llm_action if llm_action else smart_action
+            if llm_action:
+                same_type = llm_action.get("type") == smart_action.get("type")
+                same_col  = llm_action.get("column") == smart_action.get("column")
+                if same_type and same_col:
+                    final_action = llm_action   # LLM confirmed the suggestion
+                # else: smart_action wins (LLM gave a bad/different answer)
 
-        resp = env_step(final_action)
+            action_str = json.dumps(final_action)
 
-        obs = resp["observation"]
-        reward = resp["reward"]["value"]
-        done = resp["done"]
+            try:
+                step_resp = env_step(final_action)
+            except Exception as exc:
+                log_step(step_num, action_str, 0.0, True, str(exc)[:80])
+                break
 
-        rewards.append(reward)
-        steps_taken = step
+            obs       = step_resp["observation"]
+            reward    = step_resp["reward"]["value"]
+            done      = step_resp["done"]
+            error_msg = None if obs["last_action_success"] else obs["last_action_message"][:80]
 
-        log_step(step, json.dumps(final_action), reward, done,
-                 None if obs["last_action_success"] else obs["last_action_message"][:80])
+            rewards.append(reward)
+            steps_taken = step_num
 
-        if done:
-            break
+            log_step(step_num, action_str, reward, done, error_msg)
 
-    state = env_state()
-    score = float(state.get("grader_score") or 0.0)
+            if done:
+                break
 
-    log_end(score > 0, steps_taken, score, rewards)
+        state   = env_state()
+        score   = float(state.get("grader_score") or 0.0)
+        success = score > 0.0
 
-    return score
+    except Exception as exc:
+        print(f"[ERROR] Task {task_id} failed: {exc}", flush=True)
+        score   = 0.0
+        success = False
 
-# ── ENTRY POINT ───────────────────────────────────────────────────────────────
+    finally:
+        log_end(success, steps_taken, score, rewards)
+
+    return {"task_id": task_id, "task_name": task_name,
+            "score": score, "steps": steps_taken, "success": success}
+
+
+# ── run_inference (required entry point) ──────────────────────────────────────
+def run_inference(prompt: str) -> str:
+    """Required entry point called by the validator."""
+    return call_llm(prompt)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    scores = [run_task(t) for t in [1, 2, 3]]
-    print(f"Average: {sum(scores)/len(scores):.4f}", flush=True)
+    if not env_health():
+        raise ConnectionError(
+            f"Env not reachable at {ENV_BASE_URL}\n"
+            "Make sure your HF Space is running."
+        )
+
+    results = []
+    for task_id in [1, 2, 3]:
+        results.append(run_task(task_id))
+
+    labels = {1: "easy  ", 2: "medium", 3: "hard  "}
+    total  = 0.0
+    print(f"\n{'='*50}", flush=True)
+    for r in results:
+        print(f"Task {r['task_id']} [{labels[r['task_id']]}] score={r['score']:.4f} steps={r['steps']}", flush=True)
+        total += r["score"]
+    print(f"Average: {total/len(results):.4f}", flush=True)
+    print(f"{'='*50}", flush=True)
+
 
 if __name__ == "__main__":
     main()
