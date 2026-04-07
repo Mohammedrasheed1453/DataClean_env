@@ -1,0 +1,77 @@
+name: data-preparation-pipeline-agent
+version: "2.0.0"
+tags: [openenv, data-science, preprocessing, tabular, eda, feature-engineering]
+sdk: docker
+
+description: >
+  A full 4-phase data preparation environment where an AI agent learns to
+  take raw, messy real-world datasets and transform them into fully model-ready data.
+  Phases enforce strict ordering: EDA -> Cleaning -> Feature Engineering -> Validation.
+  Phase gating is enforced — the agent cannot skip phases.
+  Reward is dense and progressive: fires at every step, not just at completion.
+
+author: openenv-hackathon
+
+api:
+  reset:  POST /reset
+  step:   POST /step
+  state:  GET  /state
+  health: GET  /health
+
+tasks:
+  - id: 1
+    name: customer-churn-prep
+    difficulty: easy
+    max_steps: 18
+    description: >
+      Customer churn dataset — missing values in age (15%) and monthly_charges (12%),
+      dtype error in tenure_months (stored as "24 months"), outliers in total_charges,
+      high cardinality in city (150 unique values).
+
+  - id: 2
+    name: loan-default-prep
+    difficulty: medium
+    max_steps: 22
+    description: >
+      Loan default dataset — leaky column loan_status, 9:1 class imbalance,
+      50 duplicate rows, correlated features dti_ratio, skewed income distribution.
+
+  - id: 3
+    name: medical-readmission-prep
+    difficulty: hard
+    max_steps: 28
+    description: >
+      Hospital readmission dataset — two critical leaky columns (discharge_summary,
+      days_to_readmission), 12:1 class imbalance, heavy missing values (bmi 22%,
+      hba1c 18%), dtype error in age (string bins), skewed los_days.
+
+reward:
+  type: dense_progressive
+  description: >
+    Reward fires at EVERY step — not just at episode end.
+    Positive signals reward meaningful progress immediately.
+    Negative signals penalise bad actions immediately.
+    This guarantees the reward increases progressively toward the objective.
+  components:
+    readiness_delta:
+      value: new_readiness - prev_readiness
+      fires: every step (positive when data improves)
+    issue_fix_delta:
+      value: +0.15 for critical issues, +0.08 for others
+      fires: whenever an issue is resolved
+    phase_bonus:
+      value: +0.10
+      fires: once per phase transition (up to 3x per episode)
+    step_cost:
+      value: -0.005
+      fires: every successful action (encourages efficiency)
+    invalid_penalty:
+      value: -0.05
+      fires: immediately on any phase-gate violation
+
+grader_weights:
+  issue_coverage: 0.35
+  data_readiness: 0.25
+  phase_order:    0.25
+  efficiency:     0.15
+score_range: [0, 1]  
