@@ -23,12 +23,10 @@ from typing import Optional
 from openai import OpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# Exactly as shown in the Pre-Submission Checklist on the submission form:
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME   = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+API_KEY      = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
 ENV_BASE_URL = os.getenv("ENV_BASE_URL", "https://rash1453-data.hf.space")
-
 
 TEMPERATURE = 0.1
 MAX_TOKENS  = 512
