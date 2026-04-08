@@ -24,6 +24,7 @@ inference:
   entrypoint: "python inference.py"
   env:
     API_BASE_URL: ${API_BASE_URL}
+    HF_TOKEN: ${HF_TOKEN}
     API_KEY: ${API_KEY}
     MODEL_NAME: ${MODEL_NAME}
     ENV_BASE_URL: ${ENV_BASE_URL}
