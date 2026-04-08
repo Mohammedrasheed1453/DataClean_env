@@ -190,7 +190,7 @@ def call_llm(prompt: str, retries: int = 3) -> str:
     """
     Call the LLM through the validator's proxy. Never raises — returns "" on failure.
     """
-    global _llm_call_count
+    global _llm_call_count, _llm_client, _llm_client_mode
 
     client = get_llm_client()
     model  = os.environ.get("MODEL_NAME", MODEL_NAME)
@@ -218,11 +218,8 @@ def call_llm(prompt: str, retries: int = 3) -> str:
             # If openai client itself is broken, switch to raw requests mid-flight
             if _llm_client_mode == "openai":
                 print("[LLM] Switching to raw requests fallback", flush=True)
-                global _llm_client
                 _llm_client = "RAW"
-                global _llm_client_mode  # noqa — already global
-                # Can't re-global, so just set directly
-                pass
+                _llm_client_mode = "raw"
 
         if attempt < retries:
             time.sleep(2 * attempt)
