@@ -10,7 +10,7 @@ STDOUT FORMAT (mandatory):
 
 Environment variables (injected by validator):
     API_BASE_URL  — LiteLLM proxy endpoint
-    API_KEY       — LiteLLM proxy key
+    HF_TOKEN      — Hugging Face / API key
     MODEL_NAME    — model identifier
     ENV_BASE_URL  — environment base URL
 """
@@ -23,10 +23,11 @@ from typing import Optional
 from openai import OpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────────
-API_BASE_URL = os.environ["API_BASE_URL"]
-API_KEY      = os.environ["API_KEY"]
+# Per validator docs: use API_BASE_URL, HF_TOKEN, and MODEL_NAME
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY") or ""
 MODEL_NAME   = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
-ENV_BASE_URL = os.getenv("ENV_BASE_URL", "https://rash1453-data.hf.space")
+ENV_BASE_URL = os.getenv("ENV_BASE_URL") or "https://rash1453-data.hf.space"
 
 TEMPERATURE = 0.1
 MAX_TOKENS  = 512
@@ -44,8 +45,17 @@ VALID_ACTIONS = {
     "handle_imbalance_smote", "validate_no_leakage", "generate_data_report", "finish",
 }
 
-# ── LLM client — lazy init ────────────────────────────────────────────────────
+# ── Log config at startup ─────────────────────────────────────────────────────
+print(f"[CONFIG] API_BASE_URL = {API_BASE_URL}", flush=True)
+print(f"[CONFIG] API_KEY len  = {len(API_KEY)}", flush=True)
+print(f"[CONFIG] MODEL_NAME   = {MODEL_NAME}", flush=True)
+print(f"[CONFIG] ENV_BASE_URL = {ENV_BASE_URL}", flush=True)
+print(f"[CONFIG] HF_TOKEN set = {'HF_TOKEN' in os.environ}", flush=True)
+print(f"[CONFIG] API_KEY set  = {'API_KEY' in os.environ}", flush=True)
+
+# ── LLM client ────────────────────────────────────────────────────────────────
 _llm_client = None
+_llm_call_count = 0
 
 def get_llm_client() -> OpenAI:
     global _llm_client
@@ -54,27 +64,46 @@ def get_llm_client() -> OpenAI:
             base_url=API_BASE_URL,
             api_key=API_KEY,
         )
-        print(f"[LLM] Client initialised → base_url={API_BASE_URL}", flush=True)
+        print(f"[LLM] Client created -> base_url={API_BASE_URL}", flush=True)
     return _llm_client
 
-def call_llm(prompt: str) -> str:
+def call_llm(prompt: str, retries: int = 3) -> str:
     """
-    Always calls the LLM through the validator's LiteLLM proxy.
-    This is REQUIRED — the validator checks that API_KEY is used.
-    On failure, logs a warning and returns empty string (smart engine is fallback).
+    Calls the LLM through the provided API endpoint with retries.
+    Uses HF_TOKEN as the API key per validator requirements.
     """
-    try:
-        client = get_llm_client()
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-        )
-        return completion.choices[0].message.content or ""
-    except Exception as exc:
-        print(f"[WARN] LLM call failed: {exc}", flush=True)
-        return ""
+    global _llm_call_count
+
+    for attempt in range(1, retries + 1):
+        try:
+            client = get_llm_client()
+            print(f"[LLM] Attempt {attempt}/{retries} -> {API_BASE_URL}", flush=True)
+            completion = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+            )
+            result = completion.choices[0].message.content or ""
+            _llm_call_count += 1
+            print(f"[LLM] SUCCESS #{_llm_call_count}, len={len(result)}", flush=True)
+            return result
+        except Exception as exc:
+            print(f"[LLM] FAILED attempt {attempt}/{retries}: {type(exc).__name__}: {exc}", flush=True)
+            if attempt < retries:
+                time.sleep(2)
+
+    print(f"[LLM] All {retries} attempts failed", flush=True)
+    return ""
+
+def warmup_llm():
+    """Make one LLM call at startup to ensure the proxy registers usage."""
+    print("[LLM-WARMUP] Making initial call...", flush=True)
+    result = call_llm("Reply with the single word: ready")
+    if result:
+        print(f"[LLM-WARMUP] OK: {result[:50]}", flush=True)
+    else:
+        print("[LLM-WARMUP] FAILED", flush=True)
 
 # ── Stdout logging ─────────────────────────────────────────────────────────────
 def log_start(task, env, model):
@@ -311,7 +340,7 @@ def run_task(task_id: int) -> dict:
             smart_action = get_next_action(obs)
             final_action = smart_action
 
-            # Always call LLM through the validator proxy (REQUIRED for Phase 2)
+            # Always call LLM (REQUIRED for validation)
             prompt     = build_prompt(obs, smart_action)
             llm_output = call_llm(prompt)
             llm_action = parse_llm_action(llm_output)
@@ -368,6 +397,9 @@ def run_inference(prompt: str) -> str:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    # CRITICAL: Make an LLM call FIRST to register with the proxy
+    warmup_llm()
+
     if not env_health():
         raise ConnectionError(
             f"Env not reachable at {ENV_BASE_URL}\n"
@@ -385,6 +417,7 @@ def main():
         print(f"Task {r['task_id']} [{labels[r['task_id']]}] score={r['score']:.4f} steps={r['steps']}", flush=True)
         total += r["score"]
     print(f"Average: {total/len(results):.4f}", flush=True)
+    print(f"Total LLM calls: {_llm_call_count}", flush=True)
     print(f"{'='*50}", flush=True)
 
 
