@@ -23,24 +23,12 @@ from typing import Optional
 from openai import OpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# FIX: Use os.environ[] (raises KeyError if missing) for validator-injected vars,
-#      so we never silently fall back to a different provider.
-# We use .get() with a clear default only for non-critical vars.
+# Exactly as shown in the Pre-Submission Checklist on the submission form:
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+ENV_BASE_URL = os.getenv("ENV_BASE_URL", "https://rash1453-data.hf.space")
 
-# Accept both API_KEY and HF_TOKEN — validator may use either name.
-# Raise clearly if API_BASE_URL is missing so the issue is obvious in logs.
-API_BASE_URL = os.environ.get("API_BASE_URL") or os.environ.get("OPENAI_API_BASE", "")
-API_KEY      = os.environ.get("API_KEY")      or os.environ.get("HF_TOKEN", "no-key")
-MODEL_NAME   = os.environ.get("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
-ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "https://rash1453-data.hf.space")
-
-# Diagnostic — lets the validator log confirm env vars were received
-print(f"[CONFIG] API_BASE_URL={'SET (' + API_BASE_URL[:30] + '...)' if API_BASE_URL else 'MISSING'} "
-      f"API_KEY={'SET' if os.environ.get('API_KEY') else 'MISSING (using HF_TOKEN fallback)'} "
-      f"MODEL={MODEL_NAME}", flush=True)
-
-if not API_BASE_URL:
-    raise EnvironmentError("API_BASE_URL is not set — validator must inject this variable.")
 
 TEMPERATURE = 0.1
 MAX_TOKENS  = 512
