@@ -18,6 +18,16 @@ api:
   state:  GET  /state
   health: GET  /health
 
+# ── Inference entry point (required by validator) ─────────────────────────────
+inference:
+  script: inference.py
+  entrypoint: "python inference.py"
+  env:
+    API_BASE_URL: ${API_BASE_URL}
+    API_KEY: ${API_KEY}
+    MODEL_NAME: ${MODEL_NAME}
+    ENV_BASE_URL: ${ENV_BASE_URL}
+
 tasks:
   - id: 1
     name: customer-churn-prep
@@ -74,4 +84,4 @@ grader_weights:
   data_readiness: 0.25
   phase_order:    0.25
   efficiency:     0.15
-score_range: [0, 1]  
+score_range: [0, 1]
