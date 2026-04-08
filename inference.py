@@ -8,11 +8,11 @@ STDOUT FORMAT (mandatory):
     [STEP]  step=<n> action=<json> reward=<0.00> done=<true|false> error=<msg|null>
     [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...>
 
-Environment variables:
-    API_BASE_URL  injected by validator
-    MODEL_NAME    injected by validator
-    API_KEY       injected by validator  <- required for LiteLLM proxy
-    ENV_BASE_URL  default: https://rash1453-data.hf.space
+Environment variables (injected by validator):
+    API_BASE_URL  — LiteLLM proxy endpoint
+    API_KEY       — LiteLLM proxy key
+    MODEL_NAME    — model identifier
+    ENV_BASE_URL  — environment base URL
 """
 
 import os
@@ -27,10 +27,20 @@ from openai import OpenAI
 #      so we never silently fall back to a different provider.
 # We use .get() with a clear default only for non-critical vars.
 
-API_BASE_URL = os.environ["API_BASE_URL"]          # MUST be injected by validator
-API_KEY      = os.environ["API_KEY"]               # MUST be injected by validator
-MODEL_NAME   = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+# Accept both API_KEY and HF_TOKEN — validator may use either name.
+# Raise clearly if API_BASE_URL is missing so the issue is obvious in logs.
+API_BASE_URL = os.environ.get("API_BASE_URL") or os.environ.get("OPENAI_API_BASE", "")
+API_KEY      = os.environ.get("API_KEY")      or os.environ.get("HF_TOKEN", "no-key")
+MODEL_NAME   = os.environ.get("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
 ENV_BASE_URL = os.environ.get("ENV_BASE_URL", "https://rash1453-data.hf.space")
+
+# Diagnostic — lets the validator log confirm env vars were received
+print(f"[CONFIG] API_BASE_URL={'SET (' + API_BASE_URL[:30] + '...)' if API_BASE_URL else 'MISSING'} "
+      f"API_KEY={'SET' if os.environ.get('API_KEY') else 'MISSING (using HF_TOKEN fallback)'} "
+      f"MODEL={MODEL_NAME}", flush=True)
+
+if not API_BASE_URL:
+    raise EnvironmentError("API_BASE_URL is not set — validator must inject this variable.")
 
 TEMPERATURE = 0.1
 MAX_TOKENS  = 512
@@ -54,12 +64,11 @@ _llm_client = None
 def get_llm_client() -> OpenAI:
     global _llm_client
     if _llm_client is None:
-        # FIX: Explicitly pass the validator-injected base_url and api_key.
-        # Never hardcode or use a fallback here.
         _llm_client = OpenAI(
             base_url=API_BASE_URL,
             api_key=API_KEY,
         )
+        print(f"[LLM] Client initialised → base_url={API_BASE_URL}", flush=True)
     return _llm_client
 
 def call_llm(prompt: str) -> str:
